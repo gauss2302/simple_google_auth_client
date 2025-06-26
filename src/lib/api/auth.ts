@@ -42,7 +42,6 @@ export class AuthService {
 		}
 	}
 
-	// ... rest of methods remain the same
 	async refreshToken(refreshToken: string): Promise<{ tokens: TokenPair }> {
 		const response = await apiClient.post<{ tokens: TokenPair }>('/auth/refresh', {
 			refresh_token: refreshToken,

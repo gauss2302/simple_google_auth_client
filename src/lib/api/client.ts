@@ -11,10 +11,18 @@ class ApiClient {
 	}> = [];
 
 	constructor() {
+		// Validate required environment variables
+		if (!process.env.NEXT_PUBLIC_API_URL) {
+			throw new Error('NEXT_PUBLIC_API_URL environment variable is required');
+		}
+
 		this.client = axios.create({
 			baseURL: process.env.NEXT_PUBLIC_API_URL,
-			timeout: 10000,
+			timeout: 15000, // Increased timeout
 			withCredentials: true,
+			headers: {
+				'Content-Type': 'application/json',
+			},
 		});
 
 		this.setupInterceptors();
@@ -24,21 +32,26 @@ class ApiClient {
 		// Request interceptor
 		this.client.interceptors.request.use(
 			async (config) => {
-				// Add Authorization header
-				const tokens = getTokens();
-				if (tokens?.access_token) {
-					config.headers.Authorization = `Bearer ${tokens.access_token}`;
-				}
-
-				// Add CSRF token for protected routes
-				if (this.requiresCSRF(config.url || '', config.method || '')) {
-					await this.ensureCSRFToken();
-					if (this.csrfToken) {
-						config.headers['X-CSRF-Token'] = this.csrfToken;
+				try {
+					// Add Authorization header
+					const tokens = await getTokens();
+					if (tokens?.access_token) {
+						config.headers.Authorization = `Bearer ${tokens.access_token}`;
 					}
-				}
 
-				return config;
+					// Add CSRF token for protected routes
+					if (this.requiresCSRF(config.url || '', config.method || '')) {
+						await this.ensureCSRFToken();
+						if (this.csrfToken) {
+							config.headers['X-CSRF-Token'] = this.csrfToken;
+						}
+					}
+
+					return config;
+				} catch (error) {
+					console.error('Request interceptor error:', error);
+					return config;
+				}
 			},
 			(error) => Promise.reject(error)
 		);
@@ -64,7 +77,7 @@ class ApiClient {
 					this.isRefreshing = true;
 
 					try {
-						const tokens = getTokens();
+						const tokens = await getTokens();
 						if (!tokens?.refresh_token) {
 							throw new Error('No refresh token available');
 						}
@@ -72,7 +85,7 @@ class ApiClient {
 						const response = await this.refreshTokenRequest(tokens.refresh_token);
 						const newTokens = response.data.tokens;
 
-						setTokens(newTokens);
+						await setTokens(newTokens);
 
 						this.processQueue(newTokens.access_token, null);
 
@@ -80,8 +93,13 @@ class ApiClient {
 						return this.client(originalRequest);
 					} catch (refreshError) {
 						this.processQueue(null, refreshError);
-						clearTokens();
-						window.location.href = '/auth/login';
+						await clearTokens();
+
+						// Only redirect if we're in browser environment
+						if (typeof window !== 'undefined') {
+							window.location.href = '/auth/login';
+						}
+
 						return Promise.reject(refreshError);
 					} finally {
 						this.isRefreshing = false;
@@ -99,6 +117,15 @@ class ApiClient {
 					}
 				}
 
+				// Handle network errors with retry logic
+				if (this.isRetriableError(error) && !originalRequest._retryCount) {
+					originalRequest._retryCount = 1;
+
+					// Wait a bit before retrying
+					await new Promise(resolve => setTimeout(resolve, 1000));
+					return this.client(originalRequest);
+				}
+
 				return Promise.reject(error);
 			}
 		);
@@ -113,7 +140,7 @@ class ApiClient {
 			'/profile'
 		];
 
-		const unsafeMethods = ['POST', 'PUT', 'DELETE'];
+		const unsafeMethods = ['POST', 'PUT', 'DELETE', 'PATCH'];
 
 		// Check if it's an unsafe method or specifically protected route
 		return unsafeMethods.includes(method.toUpperCase()) ||
@@ -130,6 +157,7 @@ class ApiClient {
 		try {
 			const response = await this.client.get('/csrf-token');
 			this.csrfToken = response.data.csrf_token;
+			console.log('CSRF token refreshed');
 		} catch (error) {
 			console.error('Failed to get CSRF token:', error);
 			this.csrfToken = null;
@@ -155,8 +183,22 @@ class ApiClient {
 		return this.client.post('/auth/refresh', {
 			refresh_token: refreshToken,
 		}, {
-			headers: this.csrfToken ? { 'X-CSRF-Token': this.csrfToken } : {}
+			headers: this.csrfToken ? { 'X-CSRF-Token': this.csrfToken } : {},
+			// Don't retry refresh requests
+			_retry: true
 		});
+	}
+
+	private isRetriableError(error: any): boolean {
+		// Retry on network errors or 5xx server errors (except 501, 505)
+		return (
+			!error.response ||
+			(error.response.status >= 500 &&
+				error.response.status !== 501 &&
+				error.response.status !== 505) ||
+			error.code === 'NETWORK_ERROR' ||
+			error.code === 'ECONNABORTED'
+		);
 	}
 
 	// Public method to get CSRF token
@@ -165,21 +207,108 @@ class ApiClient {
 		return this.csrfToken;
 	}
 
+	// Enhanced HTTP methods with better error handling
 	async get<T>(url: string, config?: AxiosRequestConfig): Promise<AxiosResponse<T>> {
-		return this.client.get<T>(url, config);
+		try {
+			return await this.client.get<T>(url, config);
+		} catch (error) {
+			throw this.enhanceError(error, 'GET', url);
+		}
 	}
 
 	async post<T>(url: string, data?: any, config?: AxiosRequestConfig): Promise<AxiosResponse<T>> {
-		return this.client.post<T>(url, data, config);
+		try {
+			return await this.client.post<T>(url, data, config);
+		} catch (error) {
+			throw this.enhanceError(error, 'POST', url);
+		}
 	}
 
 	async put<T>(url: string, data?: any, config?: AxiosRequestConfig): Promise<AxiosResponse<T>> {
-		return this.client.put<T>(url, data, config);
+		try {
+			return await this.client.put<T>(url, data, config);
+		} catch (error) {
+			throw this.enhanceError(error, 'PUT', url);
+		}
 	}
 
 	async delete<T>(url: string, config?: AxiosRequestConfig): Promise<AxiosResponse<T>> {
-		return this.client.delete<T>(url, config);
+		try {
+			return await this.client.delete<T>(url, config);
+		} catch (error) {
+			throw this.enhanceError(error, 'DELETE', url);
+		}
+	}
+
+	async patch<T>(url: string, data?: any, config?: AxiosRequestConfig): Promise<AxiosResponse<T>> {
+		try {
+			return await this.client.patch<T>(url, data, config);
+		} catch (error) {
+			throw this.enhanceError(error, 'PATCH', url);
+		}
+	}
+
+	private enhanceError(error: any, method: string, url: string): any {
+		// Enhance error with additional context
+		const enhancedError = {
+			...error,
+			method,
+			url,
+			timestamp: new Date().toISOString(),
+		};
+
+		// Log security-relevant errors
+		if (error.response?.status === 401 || error.response?.status === 403) {
+			console.warn(`Security error: ${method} ${url} - ${error.response.status}`);
+		}
+
+		return enhancedError;
+	}
+
+	// Health check method
+	async healthCheck(): Promise<boolean> {
+		try {
+			await this.client.get('/health', { timeout: 5000 });
+			return true;
+		} catch (error) {
+			console.error('Health check failed:', error);
+			return false;
+		}
+	}
+
+	// Method to check if client is properly configured
+	isConfigured(): boolean {
+		return !!(
+			this.client &&
+			this.client.defaults.baseURL &&
+			process.env.NEXT_PUBLIC_API_URL
+		);
+	}
+
+	// Method to update base URL if needed
+	updateBaseURL(newBaseURL: string): void {
+		if (this.client) {
+			this.client.defaults.baseURL = newBaseURL;
+		}
+	}
+
+	// Method to add custom headers
+	setDefaultHeader(key: string, value: string): void {
+		if (this.client) {
+			this.client.defaults.headers.common[key] = value;
+		}
+	}
+
+	// Method to remove custom headers
+	removeDefaultHeader(key: string): void {
+		if (this.client && this.client.defaults.headers.common[key]) {
+			delete this.client.defaults.headers.common[key];
+		}
 	}
 }
 
+// Create and export singleton instance
 export const apiClient = new ApiClient();
+
+// Export the class for testing purposes
+export { ApiClient };
